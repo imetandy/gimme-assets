@@ -9,8 +9,10 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import string
 import sys
 import tempfile
 import unicodedata
@@ -31,27 +33,47 @@ UNRESOLVED = {"not-found", "ambiguous", "blocked"}
 EXTENSIONS = {"JPEG": ".jpg", "PNG": ".png", "TIFF": ".tif",
               "WEBP": ".webp", "AVIF": ".avif", "GIF": ".gif",
               "BMP": ".bmp", "HEIF": ".heic", "JPEG2000": ".jp2"}
+DEFAULT_FILENAME_FORMAT = "{brand}_{product}_{index:03d}"
+NAME_FIELDS = {"brand", "product", "category", "variant", "size", "sku", "view", "id", "alternative_label"}
 
 
-def slug(value):
-    return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")[:75] or "unspecified"
-
-
-def asset_name(row, index):
-    """Readable, portable names; the numeric prefix prevents collisions."""
-    parts = [row.get("category"), row["brand"], row["product"], row.get("size"), row.get("variant")]
-    if row.get("alternative_label"):
-        parts.append(row["alternative_label"].split(" — ")[0])
-    if row.get("view") and row["view"] != "front":
-        parts.append(row["view"])
-    clean = []
-    for part in parts:
-        if not part:
+def validate_filename_format(pattern):
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("Filename format must be a nonempty string.")
+    for literal, field, spec, conversion in string.Formatter().parse(pattern):
+        if re.search(r'[\\/:*?"<>|\x00-\x1f\x7f]', literal):
+            raise ValueError("Filename format must describe one filename, without paths or invalid characters.")
+        if field is None:
             continue
-        part = unicodedata.normalize("NFKD", str(part)).encode("ascii", "ignore").decode()
-        part = re.sub(r'[\\/:*?"<>|]+', "-", part)
-        clean.append(re.sub(r"\s+", " ", part).strip(" .-"))
-    return f"{index:03d} " + " - ".join(clean)[:195].rstrip(" .-")
+        if field not in NAME_FIELDS | {"index"} or conversion:
+            raise ValueError(f"Unsupported filename field: {field!r}.")
+        if spec and (field != "index" or (spec != "d" and not re.fullmatch(r"0?[1-9]d", spec))):
+            raise ValueError("Only index supports formatting, for example {index:03d}.")
+
+
+def asset_name(row, index, pattern=DEFAULT_FILENAME_FORMAT):
+    """Preserve spaces and accents inside names; underscores separate default fields."""
+    values = {}
+    for field in NAME_FIELDS:
+        value = unicodedata.normalize("NFC", str(row.get(field) or ""))
+        value = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]+', "-", value)
+        values[field] = re.sub(r"\s+", " ", value).strip(" .")
+    name = pattern.format(index=index, **values).strip(" .")
+    if not name or len(name.encode("utf-8")) > 240:
+        raise ValueError("Rendered filename must contain 1–240 UTF-8 bytes before its extension; shorten the format or names.")
+    if re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])", name.split(".")[0]):
+        raise ValueError(f"Reserved filename: {name!r}.")
+    return name
+
+
+def name_key(value):
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def copy_exclusive(source, destination):
+    """Never replace an existing file, including one created after preflight."""
+    with destination.open("xb") as output, source.open("rb") as original:
+        shutil.copyfileobj(original, output)
 
 
 def number(value):
@@ -111,7 +133,7 @@ def fetch(row, destination):
         shutil.copyfile(source, destination)
         return {"download_url": row["asset_url"], "transfer": "local-copy"}
     request = Request(row["asset_url"], headers={
-        "User-Agent": "GimmeAssets/0.1", "Accept": "image/*,*/*;q=0.5"})
+        "User-Agent": "GimmeAssets/0.2", "Accept": "image/*,*/*;q=0.5"})
     with urlopen(request, timeout=30) as response, destination.open("wb") as output:
         if not web_url(response.url):
             raise ValueError("Download redirected outside HTTP(S).")
@@ -204,8 +226,29 @@ def layout_image(source, destination, source_info, ppi):
                          f"conversion; transparency and source profile retained when present; PPI metadata set to {ppi:g}.")
 
 
-def export(rows, output, ppi):
+def export(rows, output, ppi, filename_format=DEFAULT_FILENAME_FORMAT, destination=None):
+    output = output.expanduser().resolve()
+    images = destination.expanduser().resolve() if destination is not None else output / "images"
+    if output.exists():
+        raise FileExistsError(f"Report folder already exists: {output}")
+    validate_filename_format(filename_format)
+    if images == output / "originals" or output / "originals" in images.parents:
+        raise ValueError("Image destination must be separate from the originals folder.")
+    if images.exists() and not images.is_dir():
+        raise ValueError("Image destination must be a folder.")
+    existing = {name_key(path.stem) for path in images.iterdir()} if images.exists() else set()
+    names, used = {}, set()
+    for index, row in enumerate(rows, 1):
+        if row.get("status") in UNRESOLVED:
+            continue
+        name = asset_name(row, index, filename_format)
+        key = name_key(name)
+        if key in used or key in existing:
+            raise ValueError(f"Filename collision: {name!r}. Include {{index:03d}}, change the format, or choose another destination.")
+        names[index] = name
+        used.add(key)
     output.mkdir(parents=True, exist_ok=False)
+    images.mkdir(parents=True, exist_ok=True)
     records = []
     for index, row in enumerate(rows, 1):
         record = dict(row)
@@ -220,20 +263,21 @@ def export(rows, output, ppi):
             try:
                 record.update(fetch(row, downloaded))
                 source_info = inspect(downloaded, row, ppi)
-                name = asset_name(row, index)
+                name = names[index]
                 original_path = output / "originals" / (name + EXTENSIONS.get(source_info["format"], ".img"))
                 original_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(downloaded, original_path)
+                copy_exclusive(downloaded, original_path)
                 record.update(original_file=original_path.relative_to(output).as_posix(),
                               original_sha256=source_info["sha256"], source_format=source_info["format"])
                 production, conversion = layout_image(downloaded, Path(temporary) / "layout.png", source_info, ppi)
                 record.update(inspect(production, row, ppi), conversion=conversion)
-                prefix = "REVIEW - " if record["status"] == "needs-review" else ""
-                filename = prefix + name + EXTENSIONS.get(record["format"], ".img")
-                destination = output / "images" / filename
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(production, destination)
-                record["file"] = destination.relative_to(output).as_posix()
+                filename = name + EXTENSIONS.get(record["format"], ".img")
+                image_path = images / filename
+                copy_exclusive(production, image_path)
+                try:
+                    record["file"] = Path(os.path.relpath(image_path, output)).as_posix()
+                except ValueError:  # Windows destinations can be on a different drive.
+                    record["file"] = image_path.as_posix()
             except Exception as error:
                 record.update(status="download-failed", reason=f"{type(error).__name__}: {error}")
             records.append(record)
@@ -247,13 +291,10 @@ def export(rows, output, ppi):
             continue
         for record in group:
             record["review_reasons"].append("Identical bytes used for different requested products or variants")
-            if record["status"] == "selected":
-                previous = output / record["file"]
-                destination = previous.with_name("REVIEW - " + previous.name)
-                previous.rename(destination)
-                record.update(status="needs-review", file=destination.relative_to(output).as_posix())
+            record["status"] = "needs-review"
     counts = dict(Counter(record["status"] for record in records))
     manifest = {"created_at": datetime.now(timezone.utc).isoformat(), "ppi": ppi,
+                "filename_format": filename_format, "destination": str(images),
                 "counts": counts, "records": records}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     columns = ["id", "input_id", "input_product", "category", "brand", "product", "variant", "size", "sku", "view", "alternative_group", "alternative_label", "status",
@@ -280,7 +321,9 @@ def export(rows, output, ppi):
     summary = (f"Product image export\nAsset/product rows: {len(records)}\n"
                f"Native print dimensions reported at {ppi:g} ppi; preserve aspect ratio.\n"
                "Selected means source/match/visual review passed, subject to measured size.\n"
-               "All production images share images/; REVIEW filenames identify assets needing review.\n"
+               f"Production image folder: {images}\n"
+               f"Filename format: {filename_format}\n"
+               "Review status and reasons are in image-index.csv and manifest.json; filenames carry no review labels.\n"
                "Compatible non-JPEG/PNG sources have lossless PNG production copies at native resolution.\n"
                "Reproduction permission is recorded separately from image suitability.\n" +
                "".join(f"{key}: {value}\n" for key, value in sorted(counts.items())))
@@ -291,7 +334,10 @@ def export(rows, output, ppi):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("candidates", type=Path)
-    parser.add_argument("--output", type=Path, required=True, help="New destination directory; must not exist")
+    parser.add_argument("--output", type=Path, help="New report/originals folder; defaults to exports/product-images-<timestamp>")
+    parser.add_argument("--destination", type=Path, help="Save production images directly here; existing folders are allowed without replacing files")
+    parser.add_argument("--filename-format", default=DEFAULT_FILENAME_FORMAT,
+                        help="Filename stem template, e.g. {brand}_{product}_{index:03d}; extension is automatic")
     parser.add_argument("--ppi", type=float, default=300)
     args = parser.parse_args()
     try:
@@ -299,10 +345,12 @@ def main():
             raise ValueError("PPI must be positive and finite.")
         rows = json.loads(args.candidates.read_text(encoding="utf-8-sig"))
         validate(rows)
-        counts = export(rows, args.output.expanduser().resolve(), args.ppi)
+        output = (args.output or Path("exports") / datetime.now().strftime("product-images-%Y-%m-%d-%H%M%S-%f")).expanduser().resolve()
+        destination = args.destination.expanduser().resolve() if args.destination else output / "images"
+        counts = export(rows, output, args.ppi, args.filename_format, destination)
     except (ValueError, OSError) as error:
         parser.exit(2, f"Export error: {error}\n")
-    print(json.dumps({"output": str(args.output.expanduser().resolve()), "counts": counts}, indent=2))
+    print(json.dumps({"output": str(output), "destination": str(destination), "counts": counts}, indent=2))
 
 
 if __name__ == "__main__":

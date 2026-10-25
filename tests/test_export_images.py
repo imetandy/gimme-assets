@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from PIL import Image, ImageCms
@@ -22,7 +23,7 @@ class ExportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="gimme-assets-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
         Image.new("RGB", (300, 450), "#6e819a").save(self.root / "photo.jpg", quality=95, dpi=(72, 72))
 
@@ -38,10 +39,10 @@ class ExportTests(unittest.TestCase):
         row.update(extra)
         return row
 
-    def run_export(self, rows):
+    def run_export(self, rows, **options):
         exporter.validate(rows)
         output = self.root / "export"
-        exporter.export(rows, output, 300)
+        exporter.export(rows, output, 300, **options)
         manifest = json.loads((output / "manifest.json").read_text())
         return output, manifest["records"]
 
@@ -93,7 +94,7 @@ class ExportTests(unittest.TestCase):
         output, rows = self.run_export([self.candidate("cmyk", source.name)])
         row = rows[0]
         self.assertEqual(row["status"], "needs-review")
-        self.assertTrue(Path(row["file"]).name.startswith("REVIEW - "))
+        self.assertEqual(Path(row["file"]).name, "Example Brand_cmyk_001.tif")
         self.assertEqual(row["mode"], "CMYK")
         self.assertEqual((output / row["file"]).read_bytes(), source.read_bytes())
 
@@ -106,14 +107,15 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 2)
         self.assertEqual((output / rows[0]["file"]).read_bytes(), source.read_bytes())
 
-    def test_flat_readable_names_and_explicit_alternative_label(self):
+    def test_flat_default_names_preserve_spaces_and_accents(self):
         output, rows = self.run_export([self.candidate(
-            "elixir", brand="Béauty/Brand", product="Elixir", alternative_label="Alternative B — Elixir")])
+            "elixir", brand="Béauty Brand", product="Elixir Intense", alternative_label="Alternative B — Elixir")])
         row = rows[0]
         filename = Path(row["file"])
         self.assertEqual(filename.parts[0], "images")
         self.assertEqual(len(filename.parts), 2)
-        self.assertIn("Perfumes - Beauty-Brand - Elixir - 50 ml - Alternative B", filename.name)
+        self.assertEqual(filename.name, "Béauty Brand_Elixir Intense_001.jpg")
+        self.assertEqual(row["alternative_label"], "Alternative B — Elixir")
         self.assertEqual(len(Path(row["original_file"]).parts), 2)
         self.assertFalse(any(path.is_dir() for path in (output / "images").iterdir()))
 
@@ -128,12 +130,13 @@ class ExportTests(unittest.TestCase):
         _, rows = self.run_export([self.candidate("small", target_width_cm=20, target_height_cm=30)])
         self.assertEqual(rows[0]["status"], "needs-review")
         self.assertEqual(rows[0]["print_status"], "below-target")
-        self.assertTrue(Path(rows[0]["file"]).name.startswith("REVIEW - "))
+        self.assertEqual(Path(rows[0]["file"]).name, "Example Brand_small_001.jpg")
 
     def test_duplicate_bytes_for_different_products_are_both_flagged(self):
         _, rows = self.run_export([self.candidate("one"), self.candidate("two")])
         self.assertTrue(all(row["status"] == "needs-review" for row in rows))
-        self.assertTrue(all(Path(row["file"]).name.startswith("REVIEW - ") for row in rows))
+        self.assertEqual([Path(row["file"]).name for row in rows],
+                         ["Example Brand_one_001.jpg", "Example Brand_two_002.jpg"])
         self.assertEqual(len({row["file"] for row in rows}), 2)
 
     def test_incomplete_review_is_not_approved(self):
@@ -175,6 +178,91 @@ class ExportTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertFalse(output.exists())
+
+    def test_custom_format_and_existing_destination_via_cli(self):
+        destination = self.root / "Layout assets"
+        destination.mkdir()
+        (destination / "keep.txt").write_text("Unrelated file")
+        candidates = self.root / "input.json"
+        candidates.write_text(json.dumps([self.candidate(
+            "elixir", brand="Beauty Brand", product="Elixir Intense", alternative_label="Alternative B")]))
+        output = self.root / "Reports"
+        pattern = "{index:03d} - {brand} - {product} - {size} - {alternative_label}"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), str(candidates), "--output", str(output),
+             "--destination", str(destination), "--filename-format", pattern], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        image = destination / "001 - Beauty Brand - Elixir Intense - 50 ml - Alternative B.jpg"
+        self.assertEqual(image.read_bytes(), (self.root / "photo.jpg").read_bytes())
+        self.assertEqual((destination / "keep.txt").read_text(), "Unrelated file")
+        self.assertFalse(any(path.is_dir() for path in destination.iterdir()))
+        self.assertFalse((output / "images").exists())
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["filename_format"], pattern)
+        self.assertEqual(manifest["destination"], str(destination))
+        self.assertEqual((output / manifest["records"][0]["file"]).resolve(), image)
+
+    def test_destination_only_uses_separate_default_report_folder(self):
+        candidates = self.root / "input.json"
+        candidates.write_text(json.dumps([self.candidate("serum")]))
+        destination = self.root / "My assets"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), str(candidates), "--destination", str(destination)],
+            capture_output=True, text=True, cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertTrue((destination / "Example Brand_serum_001.jpg").is_file())
+        self.assertEqual(Path(response["output"]).parent, self.root / "exports")
+        self.assertTrue((Path(response["output"]) / "manifest.json").is_file())
+
+    def test_collision_in_existing_destination_is_rejected_without_writes(self):
+        destination = self.root / "Assets"
+        destination.mkdir()
+        existing = destination / "EXAMPLE BRAND_SERUM_001.JPG"
+        existing.write_bytes(b"Keep original")
+        output = self.root / "export"
+        with self.assertRaisesRegex(ValueError, "collision"):
+            exporter.export([self.candidate("serum")], output, 300, destination=destination)
+        self.assertEqual(existing.read_bytes(), b"Keep original")
+        self.assertFalse(output.exists())
+        self.assertEqual(list(destination.iterdir()), [existing])
+
+    def test_custom_format_collision_is_rejected_before_export(self):
+        output = self.root / "export"
+        with self.assertRaisesRegex(ValueError, "collision"):
+            exporter.export([self.candidate("one"), self.candidate("two")], output, 300,
+                            filename_format="{brand}")
+        self.assertFalse(output.exists())
+
+    def test_invalid_format_cannot_escape_destination_or_read_other_fields(self):
+        for pattern in ("../{product}", "folder/{product}", r"folder\{product}",
+                        "{brand.__class__}", "{source_page_url}", "{brand!r}", "{index:999999d}",
+                        "{product", "{brand:{product}}", " ", "CON"):
+            with self.subTest(pattern=pattern):
+                output = self.root / "export"
+                with self.assertRaises(ValueError):
+                    exporter.export([self.candidate("serum")], output, 300, filename_format=pattern)
+                self.assertFalse(output.exists())
+
+    def test_filename_values_cannot_create_subfolders(self):
+        output, rows = self.run_export([self.candidate("serum", brand="Beauty/Brand", product="A:B\\C")])
+        self.assertEqual(rows[0]["file"], "images/Beauty-Brand_A-B-C_001.jpg")
+        self.assertTrue((output / rows[0]["file"]).is_file())
+
+    def test_copy_refuses_overwrite_even_after_preflight(self):
+        destination = self.root / "existing.jpg"
+        destination.write_bytes(b"Keep original")
+        with self.assertRaises(FileExistsError):
+            exporter.copy_exclusive(self.root / "photo.jpg", destination)
+        self.assertEqual(destination.read_bytes(), b"Keep original")
+
+    def test_destination_on_another_drive_records_an_absolute_path(self):
+        destination = self.root / "Other drive"
+        with patch.object(exporter.os.path, "relpath", side_effect=ValueError("Different drives")):
+            _, rows = self.run_export([self.candidate("serum")], destination=destination)
+        self.assertEqual(rows[0]["status"], "selected")
+        self.assertEqual(Path(rows[0]["file"]), destination / "Example Brand_serum_001.jpg")
+        self.assertTrue(Path(rows[0]["file"]).is_file())
 
 
 if __name__ == "__main__":
