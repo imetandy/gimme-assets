@@ -25,11 +25,12 @@ class ExportTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-        Image.new("RGB", (300, 450), "#6e819a").save(self.root / "photo.jpg", quality=95, dpi=(72, 72))
+        Image.new("RGB", (2500, 3750), "#6e819a").save(self.root / "photo.jpg", quality=95, dpi=(72, 72))
 
     def candidate(self, identifier, source="photo.jpg", **extra):
         row = {
             "id": identifier, "input_product": identifier, "category": "Perfumes",
+            "image_type": "product", "overlay_free": True,
             "brand": "Example Brand", "product": identifier, "size": "50 ml",
             "source_kind": "brand", "source_page_url": "https://brand.example/product",
             "asset_url": "https://brand.example/image", "source_evidence": "Synthetic test fixture",
@@ -50,13 +51,13 @@ class ExportTests(unittest.TestCase):
         output, rows = self.run_export([self.candidate("serum")])
         row = rows[0]
         self.assertEqual(row["status"], "selected")
-        self.assertEqual((row["max_width_cm"], row["max_height_cm"]), (2.54, 3.81))
+        self.assertEqual((row["max_width_cm"], row["max_height_cm"]), (21.167, 31.75))
         self.assertEqual((output / row["file"]).read_bytes(), (self.root / "photo.jpg").read_bytes())
         self.assertEqual((output / row["original_file"]).read_bytes(), (self.root / "photo.jpg").read_bytes())
 
     def test_png_conversion_preserves_alpha_pixels_and_icc(self):
         source = self.root / "transparent.webp"
-        Image.new("RGBA", (120, 180), (40, 80, 120, 70)).save(source, lossless=True, icc_profile=self.profile)
+        Image.new("RGBA", (2500, 2600), (40, 80, 120, 70)).save(source, lossless=True, icc_profile=self.profile)
         output, rows = self.run_export([self.candidate("transparent", source.name)])
         row = rows[0]
         self.assertEqual(row["status"], "selected")
@@ -70,7 +71,7 @@ class ExportTests(unittest.TestCase):
 
     def test_rgb_tiff_becomes_png_without_resizing(self):
         source = self.root / "source.tif"
-        Image.new("RGB", (200, 300), "purple").save(source, icc_profile=self.profile)
+        Image.new("RGB", (2500, 2600), "purple").save(source, icc_profile=self.profile)
         output, rows = self.run_export([self.candidate("tiff", source.name)])
         self.assertEqual(rows[0]["format"], "PNG")
         with Image.open(source) as original, Image.open(output / rows[0]["file"]) as converted:
@@ -79,7 +80,7 @@ class ExportTests(unittest.TestCase):
 
     def test_palette_transparency_survives_conversion(self):
         source = self.root / "palette.gif"
-        image = Image.new("P", (80, 80), 0)
+        image = Image.new("P", (2500, 2500), 0)
         image.putpalette([20, 30, 40, 240, 220, 200] + [0] * 762)
         image.putpixel((20, 20), 1)
         image.save(source, transparency=0)
@@ -90,7 +91,7 @@ class ExportTests(unittest.TestCase):
 
     def test_cmyk_source_is_held_without_silent_colour_conversion(self):
         source = self.root / "cmyk.tif"
-        Image.new("CMYK", (100, 100), (0, 120, 70, 20)).save(source)
+        Image.new("CMYK", (2500, 2500), (0, 120, 70, 20)).save(source)
         output, rows = self.run_export([self.candidate("cmyk", source.name)])
         row = rows[0]
         self.assertEqual(row["status"], "needs-review")
@@ -100,8 +101,8 @@ class ExportTests(unittest.TestCase):
 
     def test_multipage_source_is_not_silently_reduced_to_one_page(self):
         source = self.root / "pages.tif"
-        Image.new("RGB", (100, 100), "red").save(
-            source, save_all=True, append_images=[Image.new("RGB", (100, 100), "blue")])
+        Image.new("RGB", (2500, 2500), "red").save(
+            source, save_all=True, append_images=[Image.new("RGB", (2500, 2500), "blue")])
         output, rows = self.run_export([self.candidate("pages", source.name)])
         self.assertEqual(rows[0]["status"], "needs-review")
         self.assertEqual(rows[0]["frames"], 2)
@@ -124,10 +125,10 @@ class ExportTests(unittest.TestCase):
         row = rows[0]
         self.assertEqual((row["usable_width_px"], row["usable_height_px"]), (200, 300))
         self.assertAlmostEqual(row["max_width_cm"], 1.693, places=3)
-        self.assertEqual(row["full_max_width_cm"], 2.54)
+        self.assertEqual(row["full_max_width_cm"], 21.167)
 
     def test_insufficient_target_resolution_requires_review(self):
-        _, rows = self.run_export([self.candidate("small", target_width_cm=20, target_height_cm=30)])
+        _, rows = self.run_export([self.candidate("small", target_width_cm=30, target_height_cm=45)])
         self.assertEqual(rows[0]["status"], "needs-review")
         self.assertEqual(rows[0]["print_status"], "below-target")
         self.assertEqual(Path(rows[0]["file"]).name, "Example Brand_small_001.jpg")
@@ -187,12 +188,12 @@ class ExportTests(unittest.TestCase):
         candidates.write_text(json.dumps([self.candidate(
             "elixir", brand="Beauty Brand", product="Elixir Intense", alternative_label="Alternative B")]))
         output = self.root / "Reports"
-        pattern = "{index:03d} - {brand} - {product} - {size} - {alternative_label}"
+        pattern = "{index:03d} - {brand} - {product} - {image_type} - {size} - {alternative_label}"
         result = subprocess.run(
             [sys.executable, str(SCRIPT), str(candidates), "--output", str(output),
              "--destination", str(destination), "--filename-format", pattern], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        image = destination / "001 - Beauty Brand - Elixir Intense - 50 ml - Alternative B.jpg"
+        image = destination / "001 - Beauty Brand - Elixir Intense - product - 50 ml - Alternative B.jpg"
         self.assertEqual(image.read_bytes(), (self.root / "photo.jpg").read_bytes())
         self.assertEqual((destination / "keep.txt").read_text(), "Unrelated file")
         self.assertFalse(any(path.is_dir() for path in destination.iterdir()))
@@ -263,6 +264,85 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "selected")
         self.assertEqual(Path(rows[0]["file"]), destination / "Example Brand_serum_001.jpg")
         self.assertTrue(Path(rows[0]["file"]).is_file())
+
+    def test_primary_rule_accepts_square_portrait_and_landscape(self):
+        candidates = []
+        for index, size in enumerate(((2500, 2500), (2500, 3000), (3000, 2500))):
+            name = f"shape-{index}.png"
+            Image.new("RGB", size, (30 + index, 80, 120)).save(self.root / name)
+            candidates.append(self.candidate(f"shape-{index}", name))
+        _, rows = self.run_export(candidates)
+        self.assertTrue(all(row["status"] == "selected" and row["resolution_tier"] == "primary" for row in rows))
+
+    def test_fallback_requires_both_sides_and_documented_search(self):
+        Image.new("RGB", (1900, 2500), "red").save(self.root / "fallback.png")
+        Image.new("RGB", (5000, 1899), "blue").save(self.root / "narrow.png")
+        evidence = dict(primary_search_exhausted=True, fallback_reason="No qualifying 2500 px originals found",
+                        sources_checked=["https://brand.example/product", "https://retailer.example/product"])
+        output, rows = self.run_export([
+            self.candidate("allowed", "fallback.png", **evidence),
+            self.candidate("not-authorized", "fallback.png"),
+            self.candidate("too-narrow", "narrow.png", **evidence),
+            self.candidate("different-product-primary"),
+        ])
+        self.assertEqual([row["status"] for row in rows], ["selected", "rejected", "rejected", "selected"])
+        self.assertEqual(rows[0]["resolution_tier"], "fallback")
+        self.assertTrue(all(not row.get("file") for row in rows[1:3]))
+        self.assertTrue(all((output / row["original_file"]).is_file() for row in rows))
+        self.assertEqual(len(list((output / "images").iterdir())), 2)
+
+    def test_fallback_is_removed_when_primary_exists_for_same_product(self):
+        Image.new("RGB", (2000, 2000), "red").save(self.root / "fallback.png")
+        output, rows = self.run_export([
+            self.candidate("lifestyle", "fallback.png", product="Serum", image_type="lifestyle", input_id="serum",
+                           primary_search_exhausted=True, fallback_reason="No large image found yet",
+                           sources_checked=["https://brand.example/product"]),
+            self.candidate("front", product="Serum", input_id="serum"),
+        ])
+        self.assertEqual(rows[0]["status"], "rejected")
+        self.assertIn("fallback is not needed", rows[0]["reason"])
+        self.assertFalse(rows[0].get("file"))
+        self.assertEqual(rows[1]["status"], "selected")
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["product_summary"][0]["lifestyle_images"], 0)
+        self.assertIn("No selected lifestyle images", manifest["product_summary"][0]["coverage_gaps"])
+
+    def test_overlays_are_rejected_and_unchecked_overlays_are_not_approved(self):
+        unchecked = self.candidate("unchecked")
+        del unchecked["overlay_free"]
+        output, rows = self.run_export([self.candidate("badge", overlay_free=False), unchecked])
+        self.assertEqual(rows[0]["status"], "rejected")
+        self.assertFalse(rows[0].get("file"))
+        self.assertTrue((output / rows[0]["original_file"]).is_file())
+        self.assertEqual(rows[1]["status"], "needs-review")
+        self.assertIn("overlay_free incomplete", rows[1]["review_reasons"])
+
+    def test_multiple_distinct_images_cover_both_types_without_type_in_default_name(self):
+        Image.new("RGB", (2500, 2500), "pink").save(self.root / "styled.png")
+        output, rows = self.run_export([
+            self.candidate("front", product="Serum", input_id="serum"),
+            self.candidate("styled", "styled.png", product="Serum", input_id="serum", image_type="lifestyle"),
+        ])
+        self.assertEqual([Path(row["file"]).name for row in rows],
+                         ["Example Brand_Serum_001.jpg", "Example Brand_Serum_002.png"])
+        coverage = json.loads((output / "manifest.json").read_text())["product_summary"]
+        self.assertEqual(len(coverage), 1)
+        self.assertEqual((coverage[0]["product_images"], coverage[0]["lifestyle_images"]), (1, 1))
+        self.assertEqual(coverage[0]["coverage_gaps"], [])
+
+    def test_identical_images_do_not_count_as_multiple_pictures_for_same_product(self):
+        output, rows = self.run_export([
+            self.candidate("one", product="Serum", input_id="serum"),
+            self.candidate("two", product="Serum", input_id="serum", image_type="lifestyle"),
+        ])
+        self.assertEqual([row["status"] for row in rows], ["selected", "rejected"])
+        self.assertEqual(len(list((output / "images").iterdir())), 1)
+
+    def test_new_metadata_has_typed_values(self):
+        for extra in ({"image_type": "promo"}, {"overlay_free": "yes"}, {"primary_search_exhausted": "true"},
+                      {"fallback_reason": 1900}, {"sources_checked": "https://brand.example/product"}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                exporter.validate([self.candidate("invalid", **extra)])
 
 
 if __name__ == "__main__":

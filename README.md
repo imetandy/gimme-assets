@@ -1,6 +1,6 @@
 # gimme-assets
 
-A Codex skill that finds official product images and downloads a clean, clearly named folder for editorial and marketing work. Built for beauty products, perfume and candles; usable for other products too.
+A Codex skill that finds multiple official product and lifestyle/styled images and downloads a clean, clearly named folder for editorial and marketing work. Built for beauty products, perfume and candles; usable for other products too.
 
 **[Download the skill ZIP](https://github.com/imetandy/gimme-assets/releases/latest/download/gimme-assets.zip)** · **[Open the skill](skills/gimme-assets/SKILL.md)**
 
@@ -29,7 +29,7 @@ The installed folder should contain `gimme-assets/SKILL.md`, alongside its `scri
 Paste a product list into Codex, or provide a CSV, spreadsheet or document. For example:
 
 ```text
-Use $gimme-assets to find official product images for:
+Use $gimme-assets to find official product and lifestyle images for:
 
 Perfumes
 - Diptyque L’Eau Papier
@@ -44,6 +44,15 @@ to my project’s exports folder.
 
 Add sizes, concentrations, shades or SKUs when they matter. You can also specify a final placement size, such as “the bottle will print 8 cm tall”, and ask Codex to assess it. If you want two similarly named products, say “include both as labelled alternatives”.
 
+### Image requirements
+
+- **Primary goal: both width and height must be at least 2500 pixels.** Square, landscape and portrait images are all welcome. A 4000 × 2000 image does not meet the primary rule.
+- **Fallback only when needed:** if no qualifying 2500 px images can be found for a product after checking official sources, images at least **1900 px on both sides** may be used for that product. The report explains each fallback. The limit never drops below 1900 px, and the skill does not upscale or add padding.
+- **Both types, multiple pictures:** aim for two distinct product shots and two lifestyle/styled pictures per product where available, unless you specify a count. Styled still lifes, props, settings and official in-use/model images can qualify. Missing types or fewer qualifying pictures are reported.
+- **No digital overlays:** exclude promo or award badges, “New”, “Best Seller”, “Organic”, stamped logos, watermarks, benefit panels, captions and other added text/graphics. Printed or embossed product branding and text physically present in the photographed background are fine.
+
+The skill checks official brand and retailer provenance for both image types. A brand's promotional infographic still fails the overlay rule. Repeated copies of the same photo do not count as multiple pictures. The 1900 px exception cannot be used simply to fill a missing lifestyle slot or reach the picture count when qualifying 2500 px pictures of that product exist.
+
 ### Filenames and save location
 
 The default filename is **`{brand}_{product}_{index:03d}`**, plus the actual image extension:
@@ -53,7 +62,7 @@ Jo Malone London_Sea Salt & Bergamot_001.png
 Dries Van Noten_Velvet Violet_002.jpg
 ```
 
-Spaces within brand and product names stay as spaces. The final number follows the input order and is padded to at least three digits. Review status appears in the reports; the skill does not add `REVIEW` to filenames.
+Spaces within brand and product names stay as spaces. The final number follows the candidate-image order across the export and is padded to at least three digits, giving multiple pictures of a product distinct names. Review status appears in the reports; the skill does not add `REVIEW` to filenames.
 
 You can supply both a destination folder and a custom filename format with your product list:
 
@@ -67,7 +76,7 @@ Report the maximum print size at 300 ppi.
 - Tom Ford Black Orchid 100 ml
 ```
 
-Supported fields are `{brand}`, `{product}`, `{index:03d}`, `{id}`, `{category}`, `{variant}`, `{size}`, `{sku}`, `{view}` and `{alternative_label}`. Leave off the extension; the skill adds the correct one. You can also describe the format in plain language. Missing optional values leave their separators in place.
+Supported fields are `{brand}`, `{product}`, `{index:03d}`, `{id}`, `{category}`, `{variant}`, `{size}`, `{sku}`, `{view}`, `{image_type}` and `{alternative_label}`. For example, `{brand}_{product}_{image_type}_{index:03d}` can distinguish product and lifestyle shots. Leave off the extension; the skill adds the correct one. You can also describe the format in plain language. Missing optional values leave their separators in place.
 
 Images go directly into the folder you specify, even when it already exists. The skill keeps originals and reports in a separate fresh export folder and refuses filename collisions rather than replacing existing files. If you omit the destination, images go into the default export's `images/` folder.
 
@@ -76,12 +85,13 @@ Images go directly into the folder you specify, even when it already exists. The
 - Searches brand websites and retailer product pages, and records where each image came from.
 - Checks the product and its variant, then inspects the downloaded image rather than relying on a search thumbnail.
 - Excludes customer uploads, influencer images, UGC-labelled galleries and other unverified sources.
+- Finds both product and lifestyle/styled shots, checks both dimensions, and excludes known overlays and disallowed fallbacks from the delivered image folder.
 - Preserves source files. Keeps original JPEGs and PNGs unchanged, and makes lossless PNG copies of compatible WebP, TIFF and other raster sources.
 - Measures both the full canvas and the useful product area, so empty margins do not exaggerate the print size.
 - Reports maximum print dimensions at **300 ppi** by default. It does not upscale small images.
 - Puts all production images in **one flat folder**, using brand, product and number by default, or your custom filename format.
 
-Sources that need attention stay in the same folder, with their status and explanation in the index. Their filenames follow your normal naming format. Missing or ambiguous products are recorded too.
+The reports account for missing and ambiguous products, review candidates and rejected images. Known overlays, images below the minimum, disallowed fallbacks and identical copies for the same product are excluded from the delivered images, with originals retained separately for audit. Filenames follow your chosen format without status labels.
 
 ## Your export
 
@@ -89,8 +99,8 @@ Sources that need attention stay in the same folder, with their status and expla
 product-images-<timestamp>/
   images/
     Jo Malone London_Sea Salt & Bergamot_001.png
-    Diptyque_Shiso candle_002.jpg
-    Loewe_Tomato Leaves candle_003.jpg
+    Jo Malone London_Sea Salt & Bergamot_002.jpg
+    Diptyque_Shiso candle_003.jpg
   originals/
     <unchanged source files>
   image-index.csv
@@ -98,7 +108,7 @@ product-images-<timestamp>/
   summary.txt
 ```
 
-The files directly inside `images/` are the ones to collect for your layout. When you supply a destination, those files go directly there instead; reports and originals stay in the export folder. `originals/` retains the downloaded sources. The CSV is the image inventory; the JSON includes detailed provenance, hashes, measurements, conversion records and review reasons. Codex can also add a simpler print-size guide, browsing sheets or a ZIP.
+The files directly inside `images/` are the ones to collect for your layout. When you supply a destination, those files go directly there instead; reports and originals stay in the export folder. `originals/` retains the downloaded sources. The CSV identifies each image's type, dimensions, resolution tier, fallback evidence and status. The JSON and summary report also show product/lifestyle counts and missing types per product. Codex can add a simpler print-size guide, browsing sheets or a ZIP.
 
 ## Print quality and image use
 

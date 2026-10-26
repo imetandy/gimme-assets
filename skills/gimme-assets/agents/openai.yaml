@@ -1,4 +1,4 @@
 interface:
   display_name: "Gimme Assets"
-  short_description: "Find official product images and check print quality"
-  default_prompt: "Use $gimme-assets to find official brand or retailer images for my product list, check their print suitability, and download an organised export folder."
+  short_description: "Find high-res product and lifestyle images for print"
+  default_prompt: "Use $gimme-assets to find multiple official product and lifestyle images for my list, with both dimensions at least 2500 px, no digital overlays, and measured print sizes."

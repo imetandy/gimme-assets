@@ -34,7 +34,9 @@ EXTENSIONS = {"JPEG": ".jpg", "PNG": ".png", "TIFF": ".tif",
               "WEBP": ".webp", "AVIF": ".avif", "GIF": ".gif",
               "BMP": ".bmp", "HEIF": ".heic", "JPEG2000": ".jp2"}
 DEFAULT_FILENAME_FORMAT = "{brand}_{product}_{index:03d}"
-NAME_FIELDS = {"brand", "product", "category", "variant", "size", "sku", "view", "id", "alternative_label"}
+PRIMARY_MIN_PX = 2500
+FALLBACK_MIN_PX = 1900
+NAME_FIELDS = {"brand", "product", "category", "variant", "size", "sku", "view", "id", "alternative_label", "image_type"}
 
 
 def validate_filename_format(pattern):
@@ -107,6 +109,8 @@ def validate(rows):
             continue
         if status != "candidate":
             raise ValueError(f"Row {index}: unsupported input status {status!r}.")
+        if row.get("image_type") not in {"product", "lifestyle"}:
+            raise ValueError(f"Row {index}: image_type must be product or lifestyle.")
         if row.get("source_kind") not in {"brand", "retailer"}:
             raise ValueError(f"Row {index}: source_kind must be brand or retailer.")
         for key in ("source_page_url", "asset_url"):
@@ -114,9 +118,14 @@ def validate(rows):
                 raise ValueError(f"Row {index}: {key} requires an HTTP(S) URL without credentials.")
         if not isinstance(row.get("source_evidence"), str) or not row["source_evidence"].strip():
             raise ValueError(f"Row {index}: source_evidence is required.")
-        for key in ("source_verified", "match_verified", "visual_reviewed"):
+        for key in ("source_verified", "match_verified", "visual_reviewed", "overlay_free", "primary_search_exhausted"):
             if key in row and not isinstance(row[key], bool):
                 raise ValueError(f"Row {index}: {key} must be boolean.")
+        if "fallback_reason" in row and not isinstance(row["fallback_reason"], str):
+            raise ValueError(f"Row {index}: fallback_reason must be a string.")
+        checked = row.get("sources_checked", [])
+        if not isinstance(checked, list) or not all(isinstance(url, str) and web_url(url) for url in checked):
+            raise ValueError(f"Row {index}: sources_checked must be an array of HTTP(S) URLs.")
         issues = row.get("quality_issues", [])
         if not isinstance(issues, list) or not all(isinstance(item, str) and item.strip() for item in issues):
             raise ValueError(f"Row {index}: quality_issues must be an array of nonempty strings.")
@@ -133,7 +142,7 @@ def fetch(row, destination):
         shutil.copyfile(source, destination)
         return {"download_url": row["asset_url"], "transfer": "local-copy"}
     request = Request(row["asset_url"], headers={
-        "User-Agent": "GimmeAssets/0.2", "Accept": "image/*,*/*;q=0.5"})
+        "User-Agent": "GimmeAssets/0.3", "Accept": "image/*,*/*;q=0.5"})
     with urlopen(request, timeout=30) as response, destination.open("wb") as output:
         if not web_url(response.url):
             raise ValueError("Download redirected outside HTTP(S).")
@@ -168,9 +177,23 @@ def inspect(path, row, ppi):
         raise ValueError("crop_box_px is outside the orientation-corrected image.")
     usable_width, usable_height = right - left, bottom - top
     issues = list(row.get("quality_issues", []))
-    for key in ("source_verified", "match_verified", "visual_reviewed"):
+    for key in ("source_verified", "match_verified", "visual_reviewed", "overlay_free"):
         if row.get(key) is not True:
             issues.append(f"{key} incomplete")
+    rejected = []
+    if min(width, height) >= PRIMARY_MIN_PX:
+        resolution_tier = "primary"
+    elif min(width, height) >= FALLBACK_MIN_PX:
+        resolution_tier = "fallback"
+        if not (row.get("primary_search_exhausted") is True
+                and isinstance(row.get("fallback_reason"), str) and row["fallback_reason"].strip()
+                and row.get("sources_checked")):
+            rejected.append("1900 px fallback requires an exhausted 2500 px product search, a reason and sources checked")
+    else:
+        resolution_tier = "below-minimum"
+        rejected.append("Both width and height must be at least 1900 px; preferred minimum is 2500 px on both sides")
+    if row.get("overlay_free") is False:
+        rejected.append("Digitally added text, badge, logo, watermark or other graphic overlay")
     if fmt not in {"JPEG", "PNG"}:
         issues.append(f"Production compatibility review needed: {fmt}")
     if frames != 1:
@@ -187,6 +210,7 @@ def inspect(path, row, ppi):
     return {
         "format": fmt, "mode": mode, "icc_present": has_icc, "transparency": has_alpha,
         "frames": frames, "width_px": width, "height_px": height,
+        "resolution_tier": resolution_tier, "rejection_reasons": rejected,
         "crop_box_px": crop, "measurement_basis": "reviewed-crop" if "crop_box_px" in row else "full-canvas",
         "usable_width_px": usable_width, "usable_height_px": usable_height, "ppi": ppi,
         "full_max_width_cm": round(width * 2.54 / ppi, 3),
@@ -195,7 +219,8 @@ def inspect(path, row, ppi):
         "max_height_cm": round(usable_height * 2.54 / ppi, 3),
         "effective_ppi_at_target": round(target_ppi, 2) if target_ppi is not None else None,
         "print_status": print_status, "review_reasons": issues,
-        "status": "needs-review" if issues else "selected",
+        "status": "rejected" if rejected else "needs-review" if issues else "selected",
+        "reason": "; ".join(rejected),
         "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -224,6 +249,36 @@ def layout_image(source, destination, source_info, ppi):
                 raise ValueError("PNG conversion did not preserve source pixels, mode, transparency or ICC profile.")
     return destination, (f"{source_info['format']} decoded to lossless PNG; no resizing, retouching or colour "
                          f"conversion; transparency and source profile retained when present; PPI metadata set to {ppi:g}.")
+
+
+def product_key(row):
+    return tuple(str(row.get(key) or "") for key in ("input_id", "brand", "product", "variant", "size", "sku"))
+
+
+def reject_production(record, output, reason):
+    if record.get("file"):
+        (output / record.pop("file")).unlink()
+    record.setdefault("rejection_reasons", []).append(reason)
+    record.update(status="rejected", reason="; ".join(record["rejection_reasons"]))
+
+
+def product_coverage(records):
+    groups = defaultdict(list)
+    for record in records:
+        groups[product_key(record)].append(record)
+    result = []
+    for group in groups.values():
+        selected = [row for row in group if row["status"] == "selected" and row.get("file")]
+        types = Counter(row["image_type"] for row in selected)
+        gaps = [f"No selected {kind} images" for kind in ("product", "lifestyle") if not types[kind]]
+        if len(selected) < 2:
+            gaps.append("Fewer than two selected images")
+        result.append({**{key: group[0].get(key, "") for key in ("input_id", "brand", "product", "variant", "size", "sku")},
+                       "selected_images": len(selected), "product_images": types["product"],
+                       "lifestyle_images": types["lifestyle"],
+                       "fallback_images": sum(row.get("resolution_tier") == "fallback" for row in selected),
+                       "coverage_gaps": gaps})
+    return result
 
 
 def export(rows, output, ppi, filename_format=DEFAULT_FILENAME_FORMAT, destination=None):
@@ -269,6 +324,10 @@ def export(rows, output, ppi, filename_format=DEFAULT_FILENAME_FORMAT, destinati
                 copy_exclusive(downloaded, original_path)
                 record.update(original_file=original_path.relative_to(output).as_posix(),
                               original_sha256=source_info["sha256"], source_format=source_info["format"])
+                if source_info["status"] == "rejected":
+                    record.update(source_info, conversion="None; rejected before production export")
+                    records.append(record)
+                    continue
                 production, conversion = layout_image(downloaded, Path(temporary) / "layout.png", source_info, ppi)
                 record.update(inspect(production, row, ppi), conversion=conversion)
                 filename = name + EXTENSIONS.get(record["format"], ".img")
@@ -288,21 +347,36 @@ def export(rows, output, ppi, filename_format=DEFAULT_FILENAME_FORMAT, destinati
     for group in hashes.values():
         identities = {(r["brand"], r["product"], r.get("variant", ""), r.get("size", ""), r.get("sku", "")) for r in group}
         if len(identities) < 2:
+            keep = sorted(group, key=lambda row: row["status"] != "selected")[0]
+            for record in group:
+                if record is not keep:
+                    reject_production(record, output, "Duplicate image for the same product; not an additional distinct picture")
             continue
         for record in group:
             record["review_reasons"].append("Identical bytes used for different requested products or variants")
             record["status"] = "needs-review"
+    primary_products = {product_key(row) for row in records
+                        if row["status"] == "selected" and row.get("resolution_tier") == "primary"}
+    for record in records:
+        if (record.get("file") and record.get("resolution_tier") == "fallback"
+                and product_key(record) in primary_products):
+            reject_production(record, output, "A qualifying 2500 px image is available for this product; fallback is not needed")
+    coverage = product_coverage(records)
     counts = dict(Counter(record["status"] for record in records))
     manifest = {"created_at": datetime.now(timezone.utc).isoformat(), "ppi": ppi,
                 "filename_format": filename_format, "destination": str(images),
+                "pixel_policy": {"primary_min_width_px": PRIMARY_MIN_PX, "primary_min_height_px": PRIMARY_MIN_PX,
+                                 "fallback_min_width_px": FALLBACK_MIN_PX, "fallback_min_height_px": FALLBACK_MIN_PX},
+                "product_summary": coverage,
                 "counts": counts, "records": records}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    columns = ["id", "input_id", "input_product", "category", "brand", "product", "variant", "size", "sku", "view", "alternative_group", "alternative_label", "status",
+    columns = ["id", "input_id", "input_product", "category", "brand", "product", "variant", "size", "sku", "image_type", "view", "alternative_group", "alternative_label", "status",
                "file", "original_file", "original_sha256", "source_format", "conversion", "format", "width_px", "height_px", "usable_width_px", "usable_height_px",
                "measurement_basis", "ppi", "max_width_cm", "max_height_cm", "full_max_width_cm",
                "full_max_height_cm", "target_width_cm", "target_height_cm", "effective_ppi_at_target",
                "print_status", "source_kind", "source_page_url", "asset_url", "download_url",
                "source_evidence", "source_verified", "match_verified", "match_notes", "visual_reviewed",
+               "overlay_free", "resolution_tier", "primary_search_exhausted", "fallback_reason", "rejection_reasons",
                "review_reasons", "reason", "usage_terms", "usage_terms_url", "credit", "icc_present",
                "mode", "transparency", "bytes", "sha256", "retrieved_at", "sources_checked", "crop_notes", "notes"]
     with (output / "image-index.csv").open("w", newline="", encoding="utf-8-sig") as stream:
@@ -319,14 +393,20 @@ def export(rows, output, ppi, filename_format=DEFAULT_FILENAME_FORMAT, destinati
                 cells[key] = value
             writer.writerow(cells)
     summary = (f"Product image export\nAsset/product rows: {len(records)}\n"
+               f"Primary minimum: {PRIMARY_MIN_PX} px on BOTH sides; fallback: {FALLBACK_MIN_PX} px on BOTH sides only after the product search is exhausted.\n"
                f"Native print dimensions reported at {ppi:g} ppi; preserve aspect ratio.\n"
                "Selected means source/match/visual review passed, subject to measured size.\n"
                f"Production image folder: {images}\n"
                f"Filename format: {filename_format}\n"
                "Review status and reasons are in image-index.csv and manifest.json; filenames carry no review labels.\n"
                "Compatible non-JPEG/PNG sources have lossless PNG production copies at native resolution.\n"
+               "Known overlays and pixel-policy failures are excluded from the production folder; originals remain for audit.\n"
                "Reproduction permission is recorded separately from image suitability.\n" +
-               "".join(f"{key}: {value}\n" for key, value in sorted(counts.items())))
+               "".join(f"{key}: {value}\n" for key, value in sorted(counts.items())) +
+               "\nPer-product coverage (selected images only):\n" +
+               "".join(f"{row['brand']} / {row['product']}: {row['product_images']} product, {row['lifestyle_images']} lifestyle, "
+                       f"{row['fallback_images']} fallback; {'; '.join(row['coverage_gaps']) or 'both types covered'}\n"
+                       for row in coverage))
     (output / "summary.txt").write_text(summary, encoding="utf-8")
     return counts
 
